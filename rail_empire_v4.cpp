@@ -1,0 +1,1240 @@
+#include <SFML/Graphics.hpp>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <map>
+#include <set>
+#include <cmath>
+#include <queue>
+#include <numeric>
+#include <sstream>
+using namespace std;
+//Declarations -
+const int  WIN_W  = 1300;
+const int  WIN_H  = 740;
+const int  PANEL  = 320;
+const int  MAP_W  = WIN_W - PANEL;
+const int  STATUSBAR_H = 20;
+const float NODE_R = 11.f;
+const int  SIM_STEPS = 600;
+
+//Enums - 
+enum Cargo    { FOOD=0, COAL, GOODS, PASSENGERS };
+enum NodeType { CITY=0, FARM, COAL_MINE, FACTORY, STATION };
+enum RouteType{ RT_MST=0, RT_SPT, RT_PLAYER, RT_AI_PROFIT };
+enum GameState{ S_BUILD=0, S_PLAYER_RESULT, S_AI_TURN,
+                S_AI_RESULT,  S_FINAL };
+enum AlgoMode { ALGO_DIJKSTRA=0, ALGO_BELLMAN, ALGO_BFS };
+
+const char* cnames[]  = {"Food","Coal","Goods","Passengers"};
+const char* ntnames[] = {"City","Farm","Coal Mine","Factory","Station"};
+
+//Structs -
+struct Node {
+    int id;
+    sf::Vector2f pos;
+    NodeType type;
+    // industry fields
+    Cargo    produces  = FOOD;
+    int      stock     = 100;
+    int      maxStock  = 200;
+    // city fields
+    int      population= 0;
+    int      demand[4] = {0,0,0,0};
+};
+
+struct Route {
+    int u, v;
+    float len;
+    bool  isAI;
+    Cargo cargo;
+    RouteType rtype;
+    int   totalProfit = 0;
+    int   trips       = 0;
+};
+
+struct Train {
+    int   routeIdx;
+    float t       = 0.f;
+    bool  forward = true;
+};
+
+struct Finance {
+    int revenue=0, buildCost=0, maint=0;
+    int net() const { return revenue - buildCost - maint; }
+};
+
+// DP Knapsack item
+struct RouteOption {
+    int u, v, cost, score;   // greedy score = demand/dist ratio
+};
+
+vector<Node>    nodes;
+vector<Route>   routes;
+vector<Train>   trains;
+
+Finance  pFin, aFin;
+int      playerBudget = 2500, aiBudget = 2500;
+int      selected = -1, hovered = -1;
+
+GameState state     = S_BUILD;
+AlgoMode  algoMode  = ALGO_DIJKSTRA;
+bool usePrim = false;   // toggle MST algorithm
+bool showSPT = true;    // toggle AI SPT route lines
+bool showViz = true;    // toggle path viz overlay (Dijkstra/BF/BFS)
+bool showMST = true;
+bool showPlayer = true;    // toggle player routes
+bool showAlgoLog = true;
+
+// Dijkstra / Bellman-Ford / BFS result
+int pathSrc  = -1;
+vector<int> pathPrev;
+vector<float> pathDist;
+vector<bool> bfsVisited;
+string algoLog;
+
+sf::Font font;
+
+// Complexity shown in frontend for references
+map<string,string> complexity = {
+    {"Kruskal",    "O(E log E)"},
+    {"Prim",       "O((V+E) log V)"},
+    {"Dijkstra",   "O((V+E) log V)"},
+    {"Bellman-Ford","O(VxE)"},
+    {"BFS",        "O(V+E)"},
+    {"MergeSort",  "O(n log n)"},
+    {"Knapsack",   "O(nxW)"},
+    {"DSU find",   "O(a(n)) ~O(1)"}
+};
+
+float vdist(sf::Vector2f a, sf::Vector2f b){
+    return hypotf(a.x-b.x, a.y-b.y);
+}
+sf::Vector2f npos(int id){ return nodes[id].pos; }
+int N(){ return (int)nodes.size(); }
+
+sf::Color cargoCol(Cargo c){
+    switch(c){
+        case FOOD:       
+        return {80,220,80};
+        case COAL:       
+        return {160,160,160};
+        case GOODS:      
+        return {255,180,50};
+        case PASSENGERS: 
+        return {100,200,255};
+    }
+    return sf::Color::White;
+}
+
+sf::Color nodeCol(const Node& n){
+    switch(n.type){
+        case CITY:      
+        return {70,150,255};
+        case FARM:      
+        return {50,200,50};
+        case COAL_MINE: 
+        return {150,150,150};
+        case FACTORY:   
+        return {255,130,30};
+        case STATION:   
+        return {170,120,255};
+    }
+    return sf::Color::White;
+}
+
+// Map Generation
+
+// Fixed layout with small random jitter  -  clear supply chain zones:
+//   Zone A (left):   Farms (Food sources)        x~120
+//   Zone B (mid-L):  Coal Mines                  x~310
+//   Zone C (mid-R):  Factories (Coal->Goods)     x~510
+//   Zone D (right):  Cities (consumers)          x~780-1020
+// This function sets up the game world with all the nodes for a fair start
+void generateMap(){
+    srand((unsigned)time(nullptr));
+    nodes.clear(); 
+    routes.clear(); 
+    trains.clear();
+
+    auto jit = [](int v, int r){ 
+        return v + (rand()%r) - r/2; 
+    };
+
+    auto add = [&](NodeType t, float bx, float by,
+                   Cargo prod=FOOD, int pop=0,
+                   int dF=0, int dG=0, int dP=0){
+        Node n;
+        n.id = (int)nodes.size();
+        n.pos  = { bx, by };
+        n.type = t;
+        n.produces = prod;
+        n.stock = 80 + rand()%40;
+        n.maxStock = 200;
+        n.population = pop;
+        n.demand[FOOD] = dF;
+        n.demand[GOODS] = dG;
+        n.demand[PASSENGERS] = dP;
+        nodes.push_back(n);
+    };
+
+    // 3 Farms  (IDs 0,1,2) - these produce food for the cities
+    add(FARM, jit(120,40), jit(160,40), FOOD);
+    add(FARM, jit(120,40), jit(420,40), FOOD);
+    add(FARM, jit(120,40), jit(680,40), FOOD);
+
+    // 2 Coal Mines  (IDs 3,4) - coal is needed for factories
+    add(COAL_MINE, jit(280,40), jit(230,40), COAL);
+    add(COAL_MINE, jit(280,40), jit(600,40), COAL);
+
+    // 2 Factories Coal->Goods  (IDs 5,6) - turn coal into goods
+    add(FACTORY, jit(470,40), jit(340,40), GOODS);
+    add(FACTORY, jit(470,40), jit(560,40), GOODS);
+
+    // 7 Cities (IDs 7-13)
+    int cityYs[] = {70, 150, 240, 330, 420, 510, 600};
+    for(int i=0;i<7;i++){
+        int pop = 4000 + rand()%5000;
+        int dF  = 60 + rand()%60;   // all cities want food
+        int dG  = 50 + rand()%60;   // all cities want goods
+        int dP  = 70 + rand()%70;
+        add(CITY, jit(820,50) + (i%2)*50,
+                  cityYs[i],
+                  FOOD, pop, dF, dG, dP);
+    }
+
+    // Stations (IDs 14-15) - transportations to connect with each other
+    add(STATION, jit(700,40),  250, PASSENGERS, 0, 0, 0, 0);
+    add(STATION, jit(700,40),  560, PASSENGERS, 0, 0, 0, 0);
+}
+
+// Disjoint Set Union for Kruskal's MST - keeps track of connected components
+struct DSU {
+    vector<int> p, rnk;
+    DSU(int n): p(n), rnk(n,0){ 
+        iota(p.begin(),p.end(),0); 
+    }
+    int find(int x){ 
+        return p[x]==x?x:p[x]=find(p[x]); 
+    }  // path compression
+    bool unite(int a, int b){
+        a=find(a); b=find(b);
+        if(a==b) return false;
+        if(rnk[a]<rnk[b]) swap(a,b);
+        p[b]=a;
+        if(rnk[a]==rnk[b]) rnk[a]++;
+        return true;
+    }
+};
+
+// MERGE SORT - sorts RouteOptions by score descending
+void mergeSort(vector<RouteOption>& v, int l, int r){
+    if(l>=r) return;
+    int m = (l+r)/2;
+    mergeSort(v,l,m);
+    mergeSort(v,m+1,r);
+    vector<RouteOption> tmp;
+    int i=l, j=m+1;
+    while(i<=m && j<=r)
+        tmp.push_back(v[i].score >= v[j].score ? v[i++] : v[j++]);
+    while(i<=m) tmp.push_back(v[i++]);
+    while(j<=r) tmp.push_back(v[j++]);
+    for(int k=l;k<=r;k++) v[k]=tmp[k-l];
+}
+
+bool routeExists(int u, int v){
+    for(auto& r:routes)
+        if((r.u==u&&r.v==v)||(r.u==v&&r.v==u)) return true;
+    return false;
+}
+
+bool addRoute(int u, int v, bool isAI, RouteType rt){
+    if(u==v || routeExists(u,v)) return false;
+    float d   = vdist(npos(u), npos(v));
+    int   cost= max(10,(int)(d*0.35f));
+
+    Finance& fin = isAI ? aFin : pFin;
+    int&   money  = isAI ? aiBudget : playerBudget;
+    if(money < cost) return false;
+
+    money -= cost;
+    fin.buildCost += cost;
+
+    // Cargo = source node's product (cities emit passengers)
+    Cargo c = (nodes[u].type==CITY) ? PASSENGERS : nodes[u].produces;
+
+    routes.push_back({u, v, d, isAI, c, rt, 0, 0});
+    trains.push_back({(int)routes.size()-1, (float)(rand()%100)/100.f, true});
+    return true;
+}
+
+// BFS (connectivity check)
+void runBFS(int src){
+    bfsVisited.assign(N(), false);
+    vector<vector<int>> adj(N());
+    for(auto& r:routes){
+        adj[r.u].push_back(r.v);
+        adj[r.v].push_back(r.u);
+    }
+    queue<int> q;
+    q.push(src); bfsVisited[src]=true;
+    algoLog  = "-- BFS from node " + to_string(src) + " --\n";
+    algoLog += complexity["BFS"] + "\n\nVisit order:\n";
+    int order=0;
+    while(!q.empty()){
+        int u=q.front(); 
+        q.pop();
+        algoLog += to_string(u);
+        if(++order%8==0) algoLog+="\n"; 
+        else algoLog+=" ";
+        for(int v:adj[u]) 
+        if(!bfsVisited[v]){
+            bfsVisited[v]=true; q.push(v);
+        }
+    }
+    pathSrc = src;
+}
+
+// DIJKSTRA 
+void runDijkstra(int src){
+    pathDist.assign(N(), 1e9f);
+    pathPrev.assign(N(), -1);
+    pathDist[src]=0.f;
+
+    vector<vector<pair<int,float>>> adj(N());
+    for(auto& r:routes){
+        adj[r.u].push_back({r.v, r.len});
+        adj[r.v].push_back({r.u, r.len});
+    }
+    priority_queue<pair<float,int>,
+                   vector<pair<float,int>>,
+                   greater<>> pq;
+    pq.push({0.f, src});
+
+    while(!pq.empty()){
+        auto [d,u]=pq.top(); 
+        pq.pop();
+        if(d>pathDist[u]) 
+        continue;
+        for(auto [v,w]:adj[u])
+            if(pathDist[u]+w < pathDist[v]){
+                pathDist[v]=pathDist[u]+w;
+                pathPrev[v]=u;
+                pq.push({pathDist[v],v});
+            }
+    }
+    pathSrc = src;
+    algoLog  = "-- DIJKSTRA SSSP --\n";
+    algoLog += complexity["Dijkstra"] + "\n";
+    algoLog += "Source: Node " + to_string(src) + "\n\n";
+    algoLog += "Node -> Dist  Parent\n";
+    for(int i=0;i<N();i++)
+        if(pathDist[i]<1e8f)
+            algoLog += " " + to_string(i) + "  ->  "
+                     + to_string((int)pathDist[i])
+                     + "  (par:" + to_string(pathPrev[i]) + ")\n";
+}
+
+// BELLMAN-FORD 
+void runBellmanFord(int src){
+    pathDist.assign(N(), 1e9f);
+    pathPrev.assign(N(), -1);
+    pathDist[src]=0.f;
+
+    // Build edge list
+    vector<tuple<int,int,float>> edges;
+    for(auto& r:routes){
+        edges.push_back({r.u, r.v, r.len});
+        edges.push_back({r.v, r.u, r.len});
+    }
+
+    algoLog  = "-- BELLMAN-FORD SSSP --\n";
+    algoLog += complexity["Bellman-Ford"] + "\n";
+    algoLog += "Source: Node " + to_string(src)
+             + "\nRelaxing " + to_string(N()-1) + " iterations...\n\n";
+
+    for(int i=0;i<N()-1;i++){
+        bool updated=false;
+        for(auto [u,v,w]:edges)
+            if(pathDist[u]<1e8f && pathDist[u]+w < pathDist[v]){
+                pathDist[v]=pathDist[u]+w;
+                pathPrev[v]=u;
+                updated=true;
+            }
+        if(!updated) { algoLog+="Early stop at iteration "+to_string(i)+"\n"; break; }
+    }
+    // Negative cycle check (in generaledges are mostly +ve only)
+    algoLog += "\nResult (no -ve cycle):\n";
+    for(int i=0;i<N();i++)
+        if(pathDist[i]<1e8f)
+            algoLog += " " + to_string(i) + " dist="
+                     + to_string((int)pathDist[i]) + "\n";
+    pathSrc = src;
+}
+
+// KRUSKAL MST
+vector<pair<int,int>> kruskalMST(){
+    vector<int> cids;
+    for(int i=0;i<N();i++) if(nodes[i].type==CITY) cids.push_back(i);
+
+    vector<tuple<float,int,int>> edges;
+    for(int a=0;a<(int)cids.size();a++)
+        for(int b=a+1;b<(int)cids.size();b++)
+            edges.push_back({vdist(npos(cids[a]),npos(cids[b])),cids[a],cids[b]});
+    sort(edges.begin(),edges.end());
+
+    DSU dsu(N());
+    vector<pair<int,int>> mst;
+    algoLog  = "KRUSKAL MST (cities)\n";
+    algoLog += complexity["Kruskal"] + "\n";
+    algoLog += to_string(edges.size()) + " city edges\n\n";
+
+    for(auto& [w,u,v]:edges){
+        if(dsu.unite(u,v)){
+            mst.push_back({u,v});
+            algoLog += "C"+to_string(u)+"-C"+to_string(v)
+                     + " w="+to_string((int)w)+"\n";
+            if((int)mst.size()==cids.size()-1) break;
+        }
+    }
+    algoLog += "\nMST: " + to_string(mst.size()) + " edges";
+    return mst;
+}
+
+// PRIM MST 
+vector<pair<int,int>> primMST(){
+    vector<int> cids;
+    for(int i=0;i<N();i++) if(nodes[i].type==CITY) cids.push_back(i);
+    if(cids.empty()) return {};
+
+    int n=N();
+    vector<float> key(n, 1e9f);
+    vector<int>   parent(n,-1);
+    vector<bool>  inMST(n,false);
+    key[cids[0]]=0.f;
+
+    priority_queue<pair<float,int>,
+                   vector<pair<float,int>>,
+                   greater<>> pq;
+    pq.push({0.f, cids[0]});
+
+    algoLog  = "PRIM MST (cities)\n";
+    algoLog += complexity["Prim"] + "\n\n";
+
+    vector<pair<int,int>> mst;
+    while(!pq.empty()){
+        auto [d,u]=pq.top(); pq.pop();
+        if(inMST[u] || nodes[u].type!=CITY) continue;
+        inMST[u]=true;
+        if(parent[u]!=-1){
+            mst.push_back({parent[u],u});
+            algoLog += "C"+to_string(parent[u])+"-C"+to_string(u)
+                     + " w="+to_string((int)d)+"\n";
+        }
+        for(int v:cids) if(!inMST[v]){
+            float w=vdist(npos(u),npos(v));
+            if(w<key[v]){ key[v]=w; parent[v]=u; pq.push({w,v}); }
+        }
+    }
+    algoLog += "\nMST: " + to_string(mst.size()) + " edges";
+    return mst;
+}
+
+// 0-1 KNAPSACK
+// Select routes to maximize total score within budget
+vector<int> knapsackSelectRoutes(vector<RouteOption>& opts, int budget){
+    int n = (int)opts.size();
+    // Scale costs to fit table (divide by 10)
+    int W = budget / 10;
+    vector<vector<int>> dp(n+1, vector<int>(W+1, 0));
+
+    for(int i=1;i<=n;i++){
+        int w = opts[i-1].cost / 10;
+        int s = opts[i-1].score;
+        for(int j=0;j<=W;j++){
+            dp[i][j] = dp[i-1][j];
+            if(j>=w && dp[i-1][j-w]+s > dp[i][j])
+                dp[i][j] = dp[i-1][j-w]+s;
+        }
+    }
+
+    // Backtrack
+    vector<int> chosen;
+    int j=W;
+    for(int i=n;i>=1;i--){
+        int w=opts[i-1].cost/10;
+        if(j>=w && dp[i][j]==dp[i-1][j-w]+opts[i-1].score){
+            chosen.push_back(i-1);
+            j-=w;
+        }
+    }
+    algoLog += "\n-- 0/1 KNAPSACK (DP) --\n";
+    algoLog += complexity["Knapsack"] + "\n";
+    algoLog += "Budget: $" + to_string(budget)
+             + "  Options: " + to_string(n) + "\n";
+    algoLog += "Selected " + to_string(chosen.size()) + " routes\n";
+    algoLog += "Max score: " + to_string(dp[n][W]) + "\n";
+    return chosen;
+}
+
+// Shortest Path Tree from a source city over the whole graph
+// Compute Dijkstra SPT over ALL cities
+void buildSPTFromCity(int src){
+    int n = N();
+    pathDist.assign(n, 1e9f);
+    pathPrev.assign(n, -1);
+    pathDist[src] = 0.f;
+
+    // Build adjacency from city-to-city
+    vector<vector<pair<int,float>>> adj(n);
+    for(int i=0;i<n;i++){
+        if(nodes[i].type != CITY) continue;
+        for(int j=0;j<n;j++){
+            if(i==j || nodes[j].type != CITY) continue;
+            float d = vdist(npos(i), npos(j));
+            adj[i].push_back({j, d});
+        }
+    }
+
+    // Dijkstra
+    priority_queue<pair<float,int>,
+                   vector<pair<float,int>>,
+                   greater<>> pq;
+    pq.push({0.f, src});
+
+    while(!pq.empty()){
+        auto [d, u] = pq.top(); pq.pop();
+        if(d > pathDist[u]) continue;
+        for(auto [v, w] : adj[u])
+            if(pathDist[u] + w < pathDist[v]){
+                pathDist[v] = pathDist[u] + w;
+                pathPrev[v] = u;
+                pq.push({pathDist[v], v});
+            }
+    }
+
+    pathSrc = src;
+}
+ /* This is the AI's turn to build its railway network automatically
+// OPPONENT (AI)
+/*
+ * Strategy
+ * Step 1 - Kruskal/Prim MST gives base connectivity
+ * Step 2 - Dijkstra SPT from highest-demand city
+ *           Union of MST + SPT = network plan
+ * Step 3 - Score every possible industry->city route 
+ *           MergeSort by score, 0/1 Knapsack to pick best within budget
+ * Step 4 - Build chosen routes
+ */
+void runAI(){
+    algoLog = "****AI TURN****\n";
+
+    //Step 1: MST -
+    auto mst = usePrim ? primMST() : kruskalMST();
+    int mstBuilt=0;
+    for(auto [u,v]:mst)
+        if(addRoute(u,v,true,RT_MST)) mstBuilt++;
+    algoLog += "MST routes built: " + to_string(mstBuilt) + "\n";
+
+    //Step 2: Dijkstra SPT from highest-demand city -
+    // Build SPT over complete distance graph (not just existing routes)
+    int richestCity=-1; int maxDemand=0;
+    for(auto& nd:nodes) if(nd.type==CITY){
+        int tot=nd.demand[FOOD]+nd.demand[GOODS]+nd.demand[PASSENGERS];
+        if(tot>maxDemand){ maxDemand=tot; richestCity=nd.id; }
+    }
+    int sptBuilt = 0;
+    if(richestCity>=0){
+        buildSPTFromCity(richestCity);
+        // SPT: add all edges from shortest path tree
+        for(int i=0;i<N();i++){
+            if(pathPrev[i]!=-1 && pathDist[i]<1e8f 
+               && nodes[i].type==CITY && nodes[pathPrev[i]].type==CITY){
+                if(addRoute(pathPrev[i], i, true, RT_SPT))
+                    sptBuilt++;
+            }
+        }
+        algoLog += "SPT city " + to_string(richestCity)
+                 + " (max demand): " + to_string(sptBuilt) + " routes\n";
+    }
+
+    //Step 3: Score industry->city routes via Greedy (MergeSort + Knapsack) -
+    algoLog += "\n-- GREEDY SCORING --\n";
+    vector<RouteOption> opts;
+    // Include ALL non-city nodes (farms, mines, factories) as sources
+    for(auto& src:nodes){
+        if(src.type==CITY) continue;
+        for(auto& dst:nodes){
+            if(dst.type!=CITY) continue;
+            float d = vdist(src.pos, dst.pos);
+            if(d<10.f) continue;
+            int demand = dst.demand[src.produces];
+            if(demand<=0) continue;
+            int score  = (int)(demand * 100.f / d);
+            int cost   = (int)(d * 0.35f);
+            opts.push_back({src.id, dst.id, cost, score});
+        }
+    }
+
+    // MergeSort by score descending
+    if(!opts.empty()) mergeSort(opts, 0, (int)opts.size()-1);
+    algoLog += "MergeSort " + to_string(opts.size())
+             + " opts " + complexity["MergeSort"] + "\n";
+
+    vector<RouteOption> topOpts;
+    set<int> usedSrc;
+    for(auto& o:opts){
+        if(usedSrc.count(o.u)) continue;
+        usedSrc.insert(o.u);
+        topOpts.push_back(o);
+        algoLog += " "+to_string(o.u)+"->"+to_string(o.v)
+                 + " sc="+to_string(o.score)+"\n";
+        if((int)topOpts.size()>=3) break;
+    }
+
+    // AI selects 2nd or 3rd best route randomly for fairness
+    // This makes the AI not too strong, so player enjoys playing against it
+    if (!topOpts.empty()) {
+        int idx = 0;
+        if (topOpts.size() >= 3) {
+            idx = 1 + (rand() % 2);  // (2nd best) or (3rd best)
+        }
+        if (topOpts[idx].cost <= aiBudget) {
+            addRoute(topOpts[idx].u, topOpts[idx].v, true, RT_AI_PROFIT);
+            algoLog += "AI chose " + std::string(idx == 1 ? "2nd" : "3rd") + " best route: " + to_string(topOpts[idx].u) + "->" + to_string(topOpts[idx].v) + "\n";
+        } 
+        else {
+            algoLog += "AI could not afford the chosen route\n";
+        }
+    }
+}
+
+/*
+ * trAIns concept: "concentration of production" - factories get coal from
+ * mines, produce goods, goods go to cities.
+ * Each route step: source stock -> destination demand -> profit.
+ */
+void simulate(bool isAI){
+    Finance& fin  = isAI ? aFin  : pFin;
+    int&    money  = isAI ? aiBudget: playerBudget;
+    // This function simulates the supply chain for 600 steps to calculate profits
+
+    for(int step=0; step<SIM_STEPS; step++){
+        // Each step represents a day in the simulation, processing all routes
+        for(auto& r:routes){
+            if(r.isAI != isAI) continue;
+            Node& src = nodes[r.u];
+            Node& dst = nodes[r.v];
+
+            // Only industry->city or city->city or station->city routes earn
+            if(src.type==CITY && dst.type==CITY){
+                // passenger route from a city to a city
+                int d = min(src.demand[PASSENGERS], 15);
+                if(d<=0) continue;
+                src.demand[PASSENGERS] -= d;
+                int profit = (int)(d * r.len * 0.04f);
+                int maint  = (int)(r.len * 0.015f);
+                money      += profit-maint;
+                fin.revenue += profit;
+                fin.maint   += maint;
+                r.totalProfit += profit;
+                r.trips++;
+            }
+            else if(src.type==STATION && dst.type==CITY){
+                // passenger route from a station to a city
+                int d = min(src.stock, 15);
+                if(d<=0) continue;
+                src.stock -= d;
+                int profit = (int)(d * r.len * 0.04f);
+                int maint  = (int)(r.len * 0.015f);
+                money      += profit-maint;
+                fin.revenue += profit;
+                fin.maint   += maint;
+                r.totalProfit += profit;
+                r.trips++;
+            }
+            else if(src.type!=CITY && src.type!=STATION && dst.type==CITY){
+                // cargo route: industry -> city
+                int demand = dst.demand[r.cargo];
+                int d = min({src.stock, demand, 20});
+                if(d<=0) continue;
+                src.stock -= d;
+                dst.demand[r.cargo] -= d;
+                int profit = (int)(d * r.len * 0.055f);
+                int maint  = (int)(r.len * 0.015f);
+                money      += profit-maint;
+                fin.revenue += profit;
+                fin.maint   += maint;
+                r.totalProfit += profit;
+                r.trips++;
+            }
+        }
+        // Demand & stock regenerate each step
+        for(auto& nd:nodes){
+            if(nd.type==CITY){
+                nd.demand[FOOD]       += 2;
+                nd.demand[GOODS]      += 2;
+                nd.demand[PASSENGERS] += 3;
+            } else {
+                nd.stock = min(nd.maxStock, nd.stock+2);
+            }
+        }
+    }
+}
+
+//DRAW UTILS
+void drawLine(sf::RenderWindow& w,
+              sf::Vector2f a, sf::Vector2f b,
+              sf::Color col, float thick=2.f){
+    sf::Vector2f d = b-a;
+    float len = hypotf(d.x,d.y);
+    if(len<0.1f) return;
+    sf::RectangleShape r({len,thick});
+    r.setOrigin({0.f,thick/2});
+    r.setPosition(a);
+    r.setRotation(sf::degrees(atan2f(d.y,d.x)*180.f/3.14159f));
+    r.setFillColor(col);
+    w.draw(r);
+}
+
+void drawText(sf::RenderWindow& w, const string& s,
+              float x, float y, int sz=13,
+              sf::Color col=sf::Color::White){
+    sf::Text t(font, s, sz);
+    t.setPosition({x,y});
+    t.setFillColor(col);
+    w.draw(t);
+}
+
+void drawTextWrap(sf::RenderWindow& w, const string& s,
+                  float x, float &y, int sz=11,
+                  sf::Color col={200,220,180}){
+    stringstream ss(s);
+    string line;
+    while(getline(ss,line)){
+        if(y > WIN_H - 60) return;
+        drawText(w, line, x, y, sz, col);
+        y += (float)(sz+3);
+    }
+}
+
+//MAIN 
+int main(){
+    sf::RenderWindow window(sf::VideoMode({WIN_W,WIN_H}),"Rail Empire - DAA TCS409");
+    window.setFramerateLimit(60);
+    bool fontLoaded = font.openFromFile("arial.ttf");
+    font.openFromFile("/System/Library/Fonts/Supplemental/Arial.ttf");
+
+    generateMap();
+    // The game starts by setting up the map with all nodes
+
+    string statusMsg = "LClick: select node to build route  |  "
+                       "RClick: run path algo  |  "
+                       "ENTER: simulate your turn";
+
+    while(window.isOpen()){
+        // Main game loop - runs every frame to handle input and draw the game
+        sf::Vector2f mp = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+
+        // Hover detection
+        hovered = -1;
+        for(int i=0;i<N();i++)
+            if(vdist(mp, npos(i)) < NODE_R+5){ hovered=i; break; }
+        
+        while(auto ev = window.pollEvent()){
+            // This loop keeps checking for events like mouse clicks or window close
+            if(ev->is<sf::Event::Closed>()) window.close();
+
+            if(auto* mb = ev->getIf<sf::Event::MouseButtonPressed>()){
+
+                // Handling mouse clicks -
+                if(mb->button == sf::Mouse::Button::Right && hovered>=0){
+                    // Path algorithm on right-click
+                    switch(algoMode){
+                        case ALGO_DIJKSTRA:  runDijkstra(hovered);    break;
+                        case ALGO_BELLMAN:   runBellmanFord(hovered); break;
+                        case ALGO_BFS:       runBFS(hovered);         break;
+                    }
+                }
+
+                if(mb->button == sf::Mouse::Button::Left && state==S_BUILD){
+                    // Left click in build mode to select nodes and build routes between them
+                    if(hovered>=0){
+                        if(selected<0){
+                            selected = hovered;
+                            statusMsg = "Node " + to_string(selected)
+                                      + " selected - click destination";
+                        } else {
+                            if(selected != hovered){
+                                float d = vdist(npos(selected), npos(hovered));
+                                int cost= max(10,(int)(d*0.35f));
+                                if(playerBudget >= cost){
+                                    addRoute(selected, hovered, false, RT_PLAYER);
+                                    statusMsg = "Route built! Cost=$" + to_string(cost)
+                                              + "  Remaining=$" + to_string(playerBudget);
+                                } else {
+                                    statusMsg = "Not enough money! Need $"+to_string(cost);
+                                }
+                            }
+                            selected=-1;
+                        }
+                    }
+                }
+            }
+
+            if(auto* kp = ev->getIf<sf::Event::KeyPressed>()){
+                using K = sf::Keyboard::Key;
+                auto key = kp->code;
+
+                // Toggle MST algorithm
+                if(key==K::P){ usePrim=!usePrim;
+                    statusMsg="AI MST algorithm set to: "+(usePrim?string("PRIM  O((V+E)logV)"):string("KRUSKAL  O(E log E)")); }
+
+                // Toggle path algo
+                if(key==K::D){ algoMode=ALGO_DIJKSTRA; statusMsg="Dijkstra ready - right-click any node to run"; }
+                if(key==K::B){ algoMode=ALGO_BELLMAN;  statusMsg="Bellman-Ford ready - right-click any node to run"; }
+                if(key==K::F){ algoMode=ALGO_BFS;      statusMsg="BFS ready - right-click any node to run"; }
+
+                // Toggle displays
+                if(key==K::M){ showMST = !showMST; statusMsg = showMST ? "MST routes: VISIBLE (green)" : "MST routes: HIDDEN"; }
+                if(key==K::S) showSPT    = !showSPT;    // toggle AI SPT route lines
+                if(key==K::V) showViz = !showViz;    // toggle Dijkstra/BF/BFS overlay
+                if(key==K::Y){ showPlayer = !showPlayer; statusMsg = showPlayer ? "Player routes: VISIBLE (blue)" : "Player routes: HIDDEN"; }
+                if(key==K::L){ showAlgoLog = !showAlgoLog; statusMsg = showAlgoLog ? "Algo log: VISIBLE" : "Algo log: HIDDEN"; }
+
+                // ENTER: simulate player turn
+                if(key==K::Enter && state==S_BUILD){
+                    simulate(false);
+                    state=S_PLAYER_RESULT;
+                    statusMsg="Your results ready. Press SPACE for AI turn.";
+                }
+
+                // SPACE: advance phases
+                if(key==K::Space){
+                    if(state==S_PLAYER_RESULT){
+                        runAI();
+                        simulate(true);
+                        state=S_AI_RESULT;
+                        statusMsg="AI done. Press SPACE for final result.";
+                    }
+                    else if(state==S_AI_RESULT){
+                        state=S_FINAL;
+                        statusMsg = pFin.net() > aFin.net()
+                                  ? "YOU WIN!  R=restart"
+                                  : "AI wins.   R=restart";
+                    }
+                }
+
+                // R: restart
+                if(key==K::R && state==S_FINAL){
+                    pFin={}; aFin={};
+                    playerBudget=2500; aiBudget=2500;
+                    selected=-1; pathSrc=-1;
+                    state=S_BUILD;
+                    algoLog="";
+                    statusMsg="New game. Build your network.";
+                    generateMap();
+                }
+
+                // C: run BFS connectivity check
+                if(key==K::C){ algoMode=ALGO_BFS; runBFS(0);
+                    statusMsg="BFS from node 0: cyan rings = reachable nodes"; }
+            }
+        }
+
+        // --- UPDATE TRAINS --------------------------------------------
+        for(auto& tr:trains){
+            Route& r = routes[tr.routeIdx];
+            float spd = max(0.003f, 1.5f/r.len);
+            if(tr.forward){ tr.t+=spd; if(tr.t>=1.f){tr.t=1.f;tr.forward=false;} }
+            else           { tr.t-=spd; if(tr.t<=0.f){tr.t=0.f;tr.forward=true;} }
+        }
+
+        window.clear(sf::Color(10,15,26));
+
+        // Drawing background zones to visually separate different areas like farms, mines, etc.
+        // Zone A: Farms (darkest green tint)
+        sf::RectangleShape zA({220.f,(float)WIN_H});
+        zA.setPosition({0,0}); zA.setFillColor({10,22,14}); window.draw(zA);
+        // Zone B: Mines (grey tint)
+        sf::RectangleShape zB({200.f,(float)WIN_H});
+        zB.setPosition({220,0}); zB.setFillColor({18,18,22}); window.draw(zB);
+        // Zone C: Factories (orange tint)
+        sf::RectangleShape zC({220.f,(float)WIN_H});
+        zC.setPosition({420,0}); zC.setFillColor({22,16,10}); window.draw(zC);
+        // Zone D: Cities (blue tint)
+        sf::RectangleShape zD({(float)(MAP_W-640),(float)WIN_H});
+        zD.setPosition({640,0}); zD.setFillColor({10,14,26}); window.draw(zD);
+
+        // Zone label headers
+        drawText(window,"FARMS",      18,  4, 9, {40,120,40});
+        drawText(window,"MINES",      228, 4, 9, {100,100,110});
+        drawText(window,"FACTORIES",  428, 4, 9, {140,80,30});
+        drawText(window,"CITIES",     680, 4, 9, {50,100,180});
+
+        // Zone divider lines
+        drawLine(window,{220,0},{220,(float)WIN_H},{30,45,30},1.f);
+        drawLine(window,{420,0},{420,(float)WIN_H},{40,35,25},1.f);
+        drawLine(window,{640,0},{640,(float)WIN_H},{25,35,55},1.f);
+
+        // Background grid
+        for(int x=0;x<MAP_W;x+=55)
+            drawLine(window,{(float)x,0},{(float)x,(float)WIN_H},{20,28,40},1.f);
+        for(int y=0;y<WIN_H;y+=55)
+            drawLine(window,{0,(float)y},{(float)MAP_W,(float)y},{20,28,40},1.f);
+
+        // -- Routes --
+        for(auto& r:routes){
+            sf::Color col;
+            switch(r.rtype){
+                case RT_MST:       col={0,210,110};    break;
+                case RT_SPT:       col={180,100,255};  break;
+                case RT_PLAYER:    col={70,150,255};   break;
+                case RT_AI_PROFIT: col={255,70,70};    break;
+            }
+            if(!showMST && r.rtype==RT_MST) continue;
+            if(!showSPT && r.rtype==RT_SPT) continue;
+            if(!showPlayer && r.rtype==RT_PLAYER) continue;
+
+            drawLine(window, npos(r.u), npos(r.v), col, 2.5f);
+
+            // Profit label  -  offset perpendicular to route so it never overlaps
+            if(r.totalProfit>0){
+                sf::Vector2f a=npos(r.u), b=npos(r.v);
+                sf::Vector2f mid=(a+b)*0.5f;
+                // perpendicular offset
+                sf::Vector2f d=b-a;
+                float len=hypotf(d.x,d.y);
+                if(len>1.f){
+                    sf::Vector2f perp={-d.y/len*14.f, d.x/len*14.f};
+                    // Keep offset toward screen center to avoid going offscreen
+                    if(perp.y > 0) perp = {-perp.x,-perp.y};
+                    mid += perp;
+                }
+                drawText(window,"$"+to_string(r.totalProfit),
+                         mid.x-10, mid.y-6, 9, {255,230,90});
+            }
+        }
+
+        // -- Dijkstra/Bellman-Ford path viz (drawn OVER routes) --
+        if(pathSrc>=0 && showViz && algoMode!=ALGO_BFS){
+            for(int i=0;i<N();i++)
+                if(pathPrev[i]>=0 && pathDist[i]<1e8f){
+                    // Draw thick bright yellow line over everything
+                    drawLine(window, npos(pathPrev[i]), npos(i),
+                             {255,255,0,255}, 4.f);
+                    // Small dot at each reached node
+                    sf::CircleShape dot(5.f);
+                    dot.setOrigin({5.f,5.f});
+                    dot.setPosition(npos(i));
+                    dot.setFillColor({255,255,0,255});
+                    window.draw(dot);
+                }
+        }
+        // -- BFS viz (drawn OVER routes) --
+        if(pathSrc>=0 && showViz && algoMode==ALGO_BFS){
+            for(int i=0;i<N();i++)
+                if((int)bfsVisited.size()>i && bfsVisited[i])
+                    drawLine(window, npos(pathSrc), npos(i),
+                             {100,255,255,220}, 3.f);
+        }
+
+        // -- Cost preview while building --
+        if(state==S_BUILD && selected>=0 && hovered<0){
+            float d=vdist(npos(selected),mp);
+            drawLine(window, npos(selected), mp,
+                     {255,255,255,60}, 1.5f);
+            drawText(window,"$"+to_string(max(10,(int)(d*0.35f))),
+                     mp.x+5, mp.y-16, 11, {200,200,200});
+        }
+
+        // -- Trains --
+        for(auto& tr:trains){
+            Route& r=routes[tr.routeIdx];
+            sf::Vector2f pos = npos(r.u)+(npos(r.v)-npos(r.u))*tr.t;
+            sf::CircleShape c(5.f);
+            c.setOrigin({5.f,5.f});
+            c.setPosition(pos);
+            c.setFillColor(cargoCol(r.cargo));
+            c.setOutlineThickness(1.f);
+            c.setOutlineColor({20,20,20});
+            window.draw(c);
+        }
+
+        // -- Nodes --
+        // Drawing all the nodes like cities, farms, mines, factories, and stations
+        for(int i=0;i<N();i++){
+            Node& nd=nodes[i];
+            bool sel=(selected==i), hov=(hovered==i);
+            float r=NODE_R+(hov?4:0);
+
+            sf::Color fill=nodeCol(nd);
+            sf::Color outl=sel ? sf::Color::Yellow
+                               : sf::Color(180,180,180);
+            float ot = sel?3.f:1.f;
+
+            if(nd.type==CITY){
+                sf::CircleShape s(r);
+                s.setOrigin({r,r});
+                s.setPosition(nd.pos);
+                s.setFillColor(fill);
+                s.setOutlineThickness(ot);
+                s.setOutlineColor(outl);
+                window.draw(s);
+            } else if(nd.type==STATION) {
+                sf::RectangleShape s({r*2.2f,r*2.2f});
+                s.setOrigin({r*1.1f,r*1.1f});
+                s.setPosition(nd.pos);
+                s.setRotation(sf::degrees(45.f));
+                s.setFillColor(fill);
+                s.setOutlineThickness(ot);
+                s.setOutlineColor(outl);
+                window.draw(s);
+            } else {
+                sf::RectangleShape s({r*2,r*2});
+                s.setOrigin({r,r});
+                s.setPosition(nd.pos);
+                s.setFillColor(fill);
+                s.setOutlineThickness(ot);
+                s.setOutlineColor(outl);
+                window.draw(s);
+            }
+
+            // BFS visited highlight
+            if(pathSrc>=0 && showViz && algoMode==ALGO_BFS && (int)bfsVisited.size()>i && bfsVisited[i]){
+                sf::CircleShape ring(r+4);
+                ring.setOrigin({r+4,r+4});
+                ring.setPosition(nd.pos);
+                ring.setFillColor(sf::Color::Transparent);
+                ring.setOutlineThickness(2.f);
+                ring.setOutlineColor({100,255,255,180});
+                window.draw(ring);
+            }
+
+            // Label: short ID + type hint
+            string lbl;
+            sf::Color lblCol;
+            switch(nd.type){
+                case CITY:
+                    lbl="City "+to_string(i);
+                    lblCol={160,200,255}; break;
+                case FARM:
+                    lbl="Farm "+to_string(i);
+                    lblCol={120,220,100}; break;
+                case COAL_MINE:
+                    lbl="Mine "+to_string(i);
+                    lblCol={180,180,190}; break;
+                case FACTORY:
+                    lbl="Fact "+to_string(i);
+                    lblCol={255,180,80}; break;
+                case STATION:
+                    lbl="Station "+to_string(i);
+                    lblCol={200,160,255}; break;
+                default: lbl=to_string(i); lblCol=sf::Color::White;
+            }
+            drawText(window, lbl, nd.pos.x+NODE_R+3, nd.pos.y-8, 11, lblCol);
+            // Show stock/demand under the label
+            if(nd.type==CITY){
+                string inf="F:"+to_string(nd.demand[FOOD])
+                          +" G:"+to_string(nd.demand[GOODS]);
+                drawText(window, inf, nd.pos.x+NODE_R+3, nd.pos.y+5, 9, {140,160,200});
+            } else if(nd.type==STATION){
+                drawText(window, "Station hub", nd.pos.x+NODE_R+3, nd.pos.y+5, 9, {200,180,230});
+            } else {
+                drawText(window, "stk:"+to_string(nd.stock),
+                         nd.pos.x+NODE_R+3, nd.pos.y+5, 9, {180,200,150});
+            }
+        }
+
+        // ===================== RIGHT PANEL ============================
+        // Fixed layout:
+        //  TOP  (y 0   - 44 ): title bar
+        //  SEC1 (y 44  - 130): phase + money
+        //  SEC2 (y 130 - 310): YOUR finance block
+        //  SEC3 (y 310 - 490): AI finance block  (+ winner banner)
+        //  SEC4 (y 490 - 660): Complexity table
+        //  SEC5 (y 660 - 770): Algo log  (scrollable, clipped)
+        //  SEC6 (y 770 - 880): Controls  (always pinned to bottom)
+        // ================================================================
+
+        // -- Panel background + separator -----------------------------
+        sf::RectangleShape panel({(float)PANEL,(float)WIN_H});
+        panel.setPosition({(float)MAP_W,0});
+        panel.setFillColor({13,19,33});
+        window.draw(panel);
+        drawLine(window,{(float)MAP_W,0},{(float)MAP_W,(float)WIN_H},{50,75,110},2.f);
+
+        const float PX  = MAP_W + 14.f;          // left margin inside panel
+        const float PW  = PANEL - 26.f;           // usable width
+
+        // -- SEC0: Title bar ------------------------------------------
+        sf::RectangleShape titleBg({(float)PANEL, 42.f});
+        titleBg.setPosition({(float)MAP_W, 0.f});
+        titleBg.setFillColor({8,14,28});
+        window.draw(titleBg);
+        drawText(window, "RAIL EMPIRE", PX, 6.f,  19, {255,210,50});
+        drawText(window, "DAA Project  TCS409", PX, 26.f, 10, {75,105,145});
+        drawLine(window,{(float)MAP_W,42.f},{(float)WIN_W,42.f},{45,70,105},1.f);
+
+        // -- SEC1: Phase indicator + money ----------------------------
+        float py = 48.f;
+        // States: S_BUILD=0, S_PLAYER_RESULT=1, S_AI_TURN=2(unused),
+        //          S_AI_RESULT=3, S_FINAL=4
+        const char* phStr[] = {
+            "BUILD   Your turn - build routes",
+            "DONE    Simulated - press SPACE for AI",
+            "AI      (unused)",
+            "AI DONE Press SPACE for final result",
+            "FINAL   Game over - press R to restart"
+        };
+        // Colored phase pill
+        sf::Color phCol = (state==S_BUILD)         ? sf::Color{40,120,60}
+                        : (state==S_PLAYER_RESULT)  ? sf::Color{40,80,130}
+                        : (state==S_FINAL)           ? sf::Color{120,40,40}
+                        :                              sf::Color{100,60,20};
+        sf::RectangleShape phPill({PW, 22.f});
+        phPill.setPosition({PX-2.f, py}); phPill.setFillColor(phCol);
+        window.draw(phPill);
+        drawText(window, phStr[(int)state], PX+4.f, py+4.f, 11, {230,255,230});
+        py += 26.f;
+
+        // Money row - two columns
+        sf::RectangleShape monBg({PW, 20.f});
+        monBg.setPosition({PX-2.f, py}); monBg.setFillColor({18,28,48});
+        window.draw(monBg);
+        drawText(window, "YOU  $"+to_string(playerBudget), PX+4.f, py+3.f, 11,
+                 playerBudget>500 ? sf::Color(90,255,90) : sf::Color(255,90,90));
+        drawText(window, "AI  $"+to_string(aiBudget),  PX+158.f, py+3.f, 11, {210,140,140});
+        py += 26.f;
+
+        drawLine(window,{PX,py},{PX+PW,py},{45,70,105},1.f); py += 7.f;
+
+        // -- Helper: draw one finance block ---------------------------
+        auto drawFinBlock = [&](const string& who, Finance& f, sf::Color hdr) {
+            // Section header
+            sf::RectangleShape hdrBg({PW, 18.f});
+            hdrBg.setPosition({PX-2.f, py}); hdrBg.setFillColor({20,30,52});
+            window.draw(hdrBg);
+            drawText(window, who, PX+4.f, py+2.f, 11, hdr);
+            py += 22.f;
+
+            // Four metric rows  (label | bar | value)
+            struct Row { const char* lbl; int val; sf::Color vc; };
+            int net = f.net();
+            Row rows[] = {
+                {"Revenue",  f.revenue,   {80,220,80}},
+                {"Build",    f.buildCost, {255,155,60}},
+                {"Maint",    f.maint,     {255,100,100}},
+                {"NET",      net,         net>=0?sf::Color{80,255,80}:sf::Color{255,80,80}},
+            };
+            for(auto& row : rows) {
+                bool isNet = string(row.lbl)=="NET";
+                // Label
+                drawText(window, row.lbl, PX+4.f, py+1.f,
+                         isNet?11:10,
+                         isNet?sf::Color(220,220,220):sf::Color(150,170,200));
+                // Value (right-aligned to panel edge)
+                string valStr = "$" + to_string(row.val);
+                drawText(window, valStr, PX+PW-52.f, py+1.f,
+                         isNet?12:10, row.vc);
+                // Thin separator under last row only
+                py += isNet ? 16.f : 14.f;
+            }
+            py += 6.f;
+            drawLine(window,{PX,py},{PX+PW,py},{40,60,90},1.f); py += 7.f;
+        };
+
+        drawFinBlock("YOUR FINANCE", pFin, {100,170,255});
+        drawFinBlock("AI FINANCE",   aFin, {255,110,110});
+
+        // Winner banner (FINAL only)
+        if(state==S_FINAL){
+            bool win = pFin.net() > aFin.net();
+            sf::RectangleShape wb({PW, 28.f});
+            wb.setPosition({PX-2.f, py});
+            wb.setFillColor(win ? sf::Color{30,75,20} : sf::Color{75,20,20});
+            window.draw(wb);
+            string wMsg = win ? "YOU WIN!  +" + to_string(pFin.net()-aFin.net())
+                              : "AI WINS   +" + to_string(aFin.net()-pFin.net());
+            drawText(window, wMsg, PX+6.f, py+6.f, 13,
+                     win ? sf::Color(120,255,90) : sf::Color(255,90,90));
+            py += 34.f;
+            drawLine(window,{PX,py},{PX+PW,py},{45,70,105},1.f); py += 7.f;
+        }
+
+        // -- SEC4: Complexity table ------------------------------------
+        drawText(window, "ALGORITHM COMPLEXITY", PX, py, 10, {255,200,50}); py += 14.f;
+
+        struct CXRow { const char* algo; const char* unit; const char* big; };
+        CXRow cxRows[] = {
+            {"Kruskal MST",  "U3", "O(E log E)"},
+            {"Prim MST",     "U3", "O((V+E)logV)"},
+            {"Dijkstra",     "U3", "O((V+E)logV)"},
+            {"Bellman-Ford", "U3", "O(V x E)"},
+            {"BFS",          "U3", "O(V+E)"},
+            {"Merge Sort",   "U2", "O(n log n)"},
+            {"Knapsack DP",  "U4", "O(n x W)"},
+            {"DSU find",     "U3", "O(a(n))"},
+        };
+        for(auto& cx : cxRows) {
+            if(py > 655.f) break;
+            // Unit badge
+            sf::RectangleShape badge({22.f,13.f});
+            badge.setPosition({PX, py}); badge.setFillColor({30,55,90});
+            window.draw(badge);
+            drawText(window, cx.unit, PX+1.f, py+1.f, 8, {100,180,255});
+            // Algo name
+            drawText(window, cx.algo, PX+26.f, py+1.f, 9, {180,200,175});
+            // Complexity
+            drawText(window, cx.big,  PX+PW-68.f, py+1.f, 9, {255,215,100});
+            py += 14.f;
+        }
+        drawLine(window,{PX,py},{PX+PW,py},{45,70,105},1.f); py += 5.f;
+
+        // -- SEC5: Algo log --------------------------------------------
+        if(showAlgoLog && !algoLog.empty()){
+            drawText(window, "ALGO LOG  (L=hide)", PX, py, 10, {255,200,50}); py += 12.f;
+            stringstream logSS(algoLog);
+            string logLn;
+            while(getline(logSS, logLn)){
+                if(py >= 738.f) break;
+                drawText(window, logLn, PX, py, 9, {185,210,165}); py += 11.f;
+            }
+        }
+
+        // -- SEC6: Controls  (pinned to bottom, always visible) -------
+        sf::RectangleShape ctrlBg({(float)PANEL, 136.f});
+        ctrlBg.setPosition({(float)MAP_W, (float)(WIN_H-136)});
+        ctrlBg.setFillColor({9,14,26});
+        window.draw(ctrlBg);
+        drawLine(window,{(float)MAP_W,(float)(WIN_H-136)},
+                 {(float)WIN_W,(float)(WIN_H-136)},{50,75,110},1.f);
+
+        float bpy = WIN_H - 133.f;
+        drawText(window, "CONTROLS", PX, bpy, 10, {100,155,220}); bpy += 13.f;
+        drawLine(window,{PX,bpy},{PX+PW,bpy},{35,52,78},1.f); bpy += 4.f;
+
+        // Two-column key reference
+        struct KRow { const char* k; const char* d; };
+        KRow keys[] = {
+            {"LClick","Select + build"},   {"RClick","Run path algo"},
+            {"ENTER", "Simulate turn"},    {"SPACE", "Advance phase"},
+            {"D",     "Dijkstra mode"},    {"B",     "Bellman-Ford mode"},
+            {"F",     "BFS mode"},         {"C",     "BFS from node 0"},
+            {"P",     "Kruskal/Prim MST"}, {"M",     "Toggle MST lines"},
+            {"S",     "Toggle SPT lines"}, {"V",     "Toggle path viz"},
+            {"Y",     "Toggle player"},    {"L",     "Toggle algo log"},
+            {"R",     "Restart"},          {"",      ""},
+        };
+        for(int ki=0; ki<16; ki++){
+            float kx = PX + (ki%2) * (PW/2.f);
+            drawText(window, keys[ki].k, kx,       bpy, 9, {255,195,70});
+            drawText(window, keys[ki].d, kx+28.f,  bpy, 9, {160,180,205});
+            if(ki%2==1) bpy += 12.f;
+        }
+
+        window.display();
+    }
+    return 0;
+}
