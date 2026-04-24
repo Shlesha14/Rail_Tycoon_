@@ -1,0 +1,7 @@
+*.o
+*.exe
+*.dSYM/
+.DS_Store
+rail_empire
+game.exe
+*.save
